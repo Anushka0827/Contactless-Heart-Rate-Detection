@@ -19,10 +19,14 @@ import tempfile
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
+
+import base64
+import cv2
+import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -60,28 +64,12 @@ def health_check():
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(video_path: str) -> dict:
-    """Execute the full analysis pipeline on a video file.
+def _run_analysis_on_roi(roi_result) -> dict:
+    """Run signal processing, HRV, and stress stages on an existing ROIResult.
 
-    Each pipeline stage is imported lazily so that the server can start
-    even when some modules are not yet implemented. Failures in any
-    stage are caught and reported in the warnings list rather than
-    crashing the entire request.
-
-    Returns a dictionary matching the API response schema.
+    Shared by both the batch /api/analyze and live /api/live endpoints.
     """
     warnings = []
-
-    # --- Stage 1: ROI extraction ---
-    try:
-        from src.roi_extractor import extract_rois
-        roi_result = extract_rois(video_path)
-    except Exception as e:
-        logger.error("ROI extraction failed: %s", e)
-        return _error_response(
-            warnings=["ROI extraction failed. Ensure the video contains a visible face."],
-            error_detail=str(e),
-        )
 
     if not roi_result.face_detected:
         return _error_response(
@@ -109,7 +97,7 @@ def run_pipeline(video_path: str) -> dict:
             "sqi_score": signal_result.sqi_score,
             "sqi_level": signal_result.sqi_level,
             "per_roi_sqi": signal_result.per_roi_sqi,
-            "bvp_waveform": signal_result.bvp_signal[:500],  # cap for payload size
+            "bvp_waveform": signal_result.bvp_signal[:500] if hasattr(signal_result, 'bvp_signal') else [],
             "hrv": None,
             "stress_level": "UNKNOWN",
             "stress_confidence": 0.0,
@@ -117,6 +105,7 @@ def run_pipeline(video_path: str) -> dict:
                 "Signal quality insufficient for reliable measurement.",
                 "Ensure adequate lighting and remain still during recording.",
             ],
+            "is_final": True,
         }
 
     # --- Stage 4: HRV analysis ---
@@ -167,16 +156,41 @@ def run_pipeline(video_path: str) -> dict:
         warnings.append("Signal quality is moderate. Results may have reduced accuracy.")
 
     return {
-        "bpm": round(hrv_result.mean_hr, 1) if hrv_result is not None else signal_result.bpm,
+        "bpm": round(hrv_result.mean_hr, 1) if hrv_result is not None and getattr(hrv_result, 'mean_hr', None) else getattr(signal_result, 'bpm', None),
         "sqi_score": signal_result.sqi_score,
         "sqi_level": signal_result.sqi_level,
         "per_roi_sqi": signal_result.per_roi_sqi,
-        "bvp_waveform": signal_result.bvp_signal[:500],
+        "bvp_waveform": signal_result.bvp_signal[:500] if hasattr(signal_result, 'bvp_signal') else [],
         "hrv": hrv_dict,
         "stress_level": stress_level,
         "stress_confidence": stress_confidence,
         "warnings": warnings,
+        "is_final": True,
     }
+
+
+def run_pipeline(video_path: str) -> dict:
+    """Execute the full analysis pipeline on a video file.
+
+    Each pipeline stage is imported lazily so that the server can start
+    even when some modules are not yet implemented. Failures in any
+    stage are caught and reported in the warnings list rather than
+    crashing the entire request.
+
+    Returns a dictionary matching the API response schema.
+    """
+    # --- Stage 1: ROI extraction ---
+    try:
+        from src.roi_extractor import extract_rois
+        roi_result = extract_rois(video_path)
+    except Exception as e:
+        logger.error("ROI extraction failed: %s", e)
+        return _error_response(
+            warnings=["ROI extraction failed. Ensure the video contains a visible face."],
+            error_detail=str(e),
+        )
+
+    return _run_analysis_on_roi(roi_result)
 
 
 def _error_response(warnings: list, error_detail: str = None) -> dict:
@@ -191,6 +205,7 @@ def _error_response(warnings: list, error_detail: str = None) -> dict:
         "stress_level": "UNKNOWN",
         "stress_confidence": 0.0,
         "warnings": warnings,
+        "is_final": True,
     }
 
 
@@ -299,6 +314,130 @@ async def analyze_video(video: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
+# WebSocket /api/live -- live webcam frame streaming
+# ---------------------------------------------------------------------------
+
+@app.websocket("/api/live")
+async def live_video_endpoint(websocket: WebSocket):
+    """Process webcam frames in real-time via WebSocket.
+
+    Protocol:
+        Client sends: {"frame": "<base64 jpeg>"} for each frame
+        Client sends: {"action": "stop"} to finalize
+        Server sends: intermediate JSON results every ~15 frames (after 2s buffer)
+        Server sends: final JSON result with is_final=True after stop
+    """
+    await websocket.accept()
+    from src.roi_extractor import (
+        _create_landmarker, _process_frame, ROI_DEFINITIONS,
+        _interpolate_gaps, _interpolate_rgb_gaps,
+    )
+    from src.models import ROIResult
+
+    try:
+        landmarker = _create_landmarker(running_mode="IMAGE")
+    except Exception as e:
+        logger.error("Could not load landmarker for WS: %s", e)
+        await websocket.close(code=1011)
+        return
+
+    fps_estimate = 10.0  # frontend sends at ~10 FPS
+    frame_count = 0
+
+    green_buffers = [[] for _ in ROI_DEFINITIONS]
+    rgb_buffers = [[] for _ in ROI_DEFINITIONS]
+    landmarks_list = []
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+            if data.get("action") == "stop":
+                break
+
+            frame_b64 = data.get("frame")
+            if not frame_b64:
+                continue
+
+            # Strip data-URL prefix if present
+            if "," in frame_b64:
+                frame_b64 = frame_b64.split(",", 1)[1]
+
+            img_bytes = base64.b64decode(frame_b64)
+            img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            frame_h, frame_w = frame.shape[:2]
+
+            # IMAGE mode — no timestamp needed
+            green_vals, rgb_vals, lm_coords = _process_frame(
+                landmarker, frame, frame_w, frame_h, timestamp_ms=None
+            )
+
+            frame_count += 1
+            if green_vals is not None:
+                landmarks_list.append(lm_coords)
+                for i in range(len(ROI_DEFINITIONS)):
+                    green_buffers[i].append(green_vals[i])
+                    rgb_buffers[i].append(rgb_vals[i])
+            else:
+                landmarks_list.append(None)
+                for i in range(len(ROI_DEFINITIONS)):
+                    green_buffers[i].append(None)
+                    rgb_buffers[i].append(None)
+
+            # Send intermediate results every 15 frames once we have >= 20 frames (~2s at 10fps)
+            if frame_count % 15 == 0 and frame_count >= 20:
+                try:
+                    roi_res = _build_live_roi(green_buffers, rgb_buffers, fps_estimate, frame_count)
+                    intermediate = _run_analysis_on_roi(roi_res)
+                    intermediate["is_final"] = False
+                    await websocket.send_json(intermediate)
+                except Exception:
+                    pass  # don't crash the stream on intermediate errors
+
+        # --- Stop received: run final analysis ---
+        if frame_count > 10:
+            roi_res = _build_live_roi(green_buffers, rgb_buffers, fps_estimate, frame_count)
+            final = _run_analysis_on_roi(roi_res)
+            final["is_final"] = True
+            await websocket.send_json(final)
+
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from live session")
+    except Exception as e:
+        logger.error("Live processing error: %s", e)
+    finally:
+        landmarker.close()
+
+
+def _build_live_roi(green_buffers, rgb_buffers, fps, frame_count):
+    """Build a clean ROIResult from live frame buffers."""
+    from src.roi_extractor import _interpolate_gaps, _interpolate_rgb_gaps
+    from src.models import ROIResult
+
+    temp_green = [_interpolate_gaps(buf, max_gap=5) for buf in green_buffers]
+    temp_rgb = [_interpolate_rgb_gaps(buf, max_gap=5) for buf in rgb_buffers]
+
+    # Scrub remaining Nones that would crash scipy.detrend
+    temp_green = [[x if x is not None else 0.0 for x in buf] for buf in temp_green]
+    temp_rgb = [
+        [[c if c is not None else 0.0 for c in p] if p is not None else [0.0, 0.0, 0.0] for p in buf]
+        for buf in temp_rgb
+    ]
+
+    return ROIResult(
+        green_signals=temp_green,
+        rgb_signals=temp_rgb,
+        face_detected=True,
+        fps=fps,
+        frame_count=frame_count,
+    )
 
 
 # ---------------------------------------------------------------------------
