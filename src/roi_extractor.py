@@ -376,26 +376,26 @@ def _check_face_alignment(lm_coords, frame_w, frame_h, cx, cy, radius):
     """Check if the face bounding box fits securely within the guide circle."""
     xs = [lm[0] * frame_w for lm in lm_coords]
     ys = [lm[1] * frame_h for lm in lm_coords]
-    
+
     min_x, max_x = min(xs), max(xs)
     min_y, max_y = min(ys), max(ys)
-    
+
     # Face bounding box center
     face_cx, face_cy = (min_x + max_x) / 2, (min_y + max_y) / 2
-    
+
     # Check if face center is relatively close to circle center
     dist_sq = (face_cx - cx) ** 2 + (face_cy - cy) ** 2
     if dist_sq > (radius * 0.5) ** 2:
         return False, "Please center your face"
-        
+
     # Check if face bounding box fits inside the circle roughly
     if min_x < cx - radius or max_x > cx + radius or min_y < cy - radius or max_y > cy + radius:
         return False, "Move back, face too large"
-        
+
     face_width = max_x - min_x
     if face_width < radius * 0.6:
         return False, "Move closer"
-        
+
     return True, "Perfect! Hold still..."
 
 
@@ -407,7 +407,7 @@ def extract_rois_webcam(
 ) -> ROIResult:
     """Capture video from a webcam and extract multi-ROI signals.
 
-    Opens the specified camera, initially runs an ALIGNMENT logic flow 
+    Opens the specified camera, initially runs an ALIGNMENT logic flow
     which ensures the patient face fits perfectly within a visual guide,
     and then captures frames for the given duration while verifying they do not step out.
 
@@ -430,7 +430,7 @@ def extract_rois_webcam(
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    
+
     cx, cy = frame_w // 2, frame_h // 2
     radius = int(min(frame_w, frame_h) * 0.35)
 
@@ -439,13 +439,13 @@ def extract_rois_webcam(
     green_buffers = [[] for _ in ROI_DEFINITIONS]
     rgb_buffers = [[] for _ in ROI_DEFINITIONS]
     landmarks_list = []
-    
+
     frame_count = 0
     face_frame_count = 0
     recorded_frames = 0
 
     roi_colors = [(0, 220, 120), (220, 160, 0), (0, 160, 220)]
-    
+
     phase = "ALIGNING"
     patient_moved = False
     start_time = None
@@ -479,11 +479,11 @@ def extract_rois_webcam(
                 # Invert mask heavily to blacken sides
                 preview_dim = cv2.bitwise_and(preview, mask)
                 preview = cv2.addWeighted(preview, 0.3, preview_dim, 0.7, 0)
-                
+
                 cv2.circle(preview, (cx, cy), radius, color, 3)
                 cv2.putText(preview, align_msg, (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
                 cv2.putText(preview, "ALIGNMENT PHASE", (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
-            
+
             if is_aligned:
                 phase = "RECORDING"
                 start_time = time.time()
@@ -497,11 +497,11 @@ def extract_rois_webcam(
             elapsed = time.time() - start_time
             if elapsed >= duration_seconds:
                 break
-                
+
             recorded_frames += 1
             if lm_coords is None or not is_aligned:
                 patient_moved = True
-                
+
             if green_vals is not None:
                 face_frame_count += 1
                 landmarks_list.append(lm_coords)
@@ -513,11 +513,11 @@ def extract_rois_webcam(
                 for i in range(len(ROI_DEFINITIONS)):
                     green_buffers[i].append(None)
                     rgb_buffers[i].append(None)
-                    
+
             if show_preview:
                 color = (0, 255, 0) if is_aligned else (0, 165, 255) # Orange warning if stepping out
                 cv2.circle(preview, (cx, cy), radius, color, 2)
-                
+
                 if green_vals is not None:
                     for j, (_, idx_list) in enumerate(ROI_DEFINITIONS):
                         points = []
@@ -530,15 +530,15 @@ def extract_rois_webcam(
                         cv2.fillPoly(overlay, [poly], roi_colors[j])
                         cv2.addWeighted(overlay, 0.2, preview, 0.8, 0, preview)
                         cv2.polylines(preview, [poly], True, roi_colors[j], 2)
-                        
+
                 remaining = max(0, duration_seconds - elapsed)
                 if not is_aligned:
-                    cv2.putText(preview, "WARNING: For accurate results please stay in frame!", 
+                    cv2.putText(preview, "WARNING: For accurate results please stay in frame!",
                                 (10, 90), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
-                                
-                cv2.putText(preview, "Analysis in process, please do not move for 30 sec", 
+
+                cv2.putText(preview, "Analysis in process, please do not move for 30 sec",
                             (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                cv2.putText(preview, f"Time: {remaining:.1f}s", 
+                cv2.putText(preview, f"Time: {remaining:.1f}s",
                             (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2)
 
         if show_preview:
@@ -550,7 +550,7 @@ def extract_rois_webcam(
     landmarker.close()
     if show_preview:
         cv2.destroyAllWindows()
-        
+
     warnings = []
     if patient_moved:
         warnings.append("During analysis patient movements out of circle observed, we recommend testing again to get accurate outcome")
