@@ -14,19 +14,18 @@ Pipeline orchestration:
 See docs/modules/06_api_server.md for implementation details.
 """
 
+import base64
 import logging
 import tempfile
 import time
 from pathlib import Path
 
+import cv2
+import numpy as np
 from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
-
-import base64
-import cv2
-import numpy as np
 
 logger = logging.getLogger(__name__)
 
@@ -332,10 +331,10 @@ async def live_video_endpoint(websocket: WebSocket):
     """
     await websocket.accept()
     from src.roi_extractor import (
-        _create_landmarker, _process_frame, ROI_DEFINITIONS,
-        _interpolate_gaps, _interpolate_rgb_gaps,
+        ROI_DEFINITIONS,
+        _create_landmarker,
+        _process_frame,
     )
-    from src.models import ROIResult
 
     try:
         landmarker = _create_landmarker(running_mode="IMAGE")
@@ -418,8 +417,8 @@ async def live_video_endpoint(websocket: WebSocket):
 
 def _build_live_roi(green_buffers, rgb_buffers, fps, frame_count):
     """Build a clean ROIResult from live frame buffers."""
-    from src.roi_extractor import _interpolate_gaps, _interpolate_rgb_gaps
     from src.models import ROIResult
+    from src.roi_extractor import _interpolate_gaps, _interpolate_rgb_gaps
 
     temp_green = [_interpolate_gaps(buf, max_gap=5) for buf in green_buffers]
     temp_rgb = [_interpolate_rgb_gaps(buf, max_gap=5) for buf in rgb_buffers]
