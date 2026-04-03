@@ -141,7 +141,8 @@ def run_pipeline(video_path: str) -> dict:
     if hrv_result is not None:
         try:
             from src.stress_classifier import classify_stress
-            stress_level, stress_confidence = classify_stress(hrv_result)
+            stress_level, stress_confidence, stress_warnings = classify_stress(hrv_result)
+            warnings.extend(stress_warnings)
         except ImportError:
             logger.warning("stress_classifier not yet implemented")
             warnings.append("Stress classification module not yet available.")
