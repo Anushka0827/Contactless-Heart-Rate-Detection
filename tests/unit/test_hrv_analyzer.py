@@ -7,7 +7,6 @@ with known statistical properties.
 """
 
 import numpy as np
-import pytest
 
 from src.hrv_analyzer import (
     clean_ibi,
