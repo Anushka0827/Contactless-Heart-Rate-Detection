@@ -86,7 +86,7 @@ def health_check():
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def _run_analysis_on_roi(roi_result) -> dict:
+def _run_analysis_on_roi(roi_result, video_path: str = None) -> dict:
     """Run signal processing, HRV, and stress stages on an existing ROIResult.
 
     Shared by both the batch /api/analyze and live /api/live endpoints.
@@ -115,19 +115,30 @@ def _run_analysis_on_roi(roi_result) -> dict:
     # --- Stage 3: SQI gate + Triage Decision Agent ---
     # TWIST 1: When SQI is LOW, switch to Visual Assessment Mode
     if signal_result.sqi_level == "LOW":
-        logger.info("SQI is LOW — Triage Decision Agent switching to Visual Assessment Mode")
-        try:
-            from src.visual_assessor import assess_visual_distress
-            visual = assess_visual_distress(video_path)
-        except Exception as e:
-            logger.error("Visual assessment failed: %s", e)
+        if video_path is not None:
+            logger.info("SQI is LOW — Triage Decision Agent switching to Visual Assessment Mode")
+            try:
+                from src.visual_assessor import assess_visual_distress
+                visual = assess_visual_distress(video_path)
+            except Exception as e:
+                logger.error("Visual assessment failed: %s", e)
+                visual = {
+                    "visual_stress_score": 0.5,
+                    "visual_stress_level": "UNKNOWN",
+                    "pallor": {"pallor_score": 0.5, "detail": "Assessment unavailable"},
+                    "breathing": {"breathing_rate": None, "breathing_score": 0.5, "detail": "Assessment unavailable"},
+                    "motion": {"motion_score": 0.5, "detail": "Assessment unavailable"},
+                    "details": [f"Visual assessment error: {e}"],
+                }
+        else:
+            logger.info("SQI is LOW but no video file available — skipping Visual Assessment Mode")
             visual = {
                 "visual_stress_score": 0.5,
                 "visual_stress_level": "UNKNOWN",
-                "pallor": {"pallor_score": 0.5, "detail": "Assessment unavailable"},
-                "breathing": {"breathing_rate": None, "breathing_score": 0.5, "detail": "Assessment unavailable"},
-                "motion": {"motion_score": 0.5, "detail": "Assessment unavailable"},
-                "details": [f"Visual assessment error: {e}"],
+                "pallor": {"pallor_score": 0.5, "detail": "Live mode - assessment unavailable"},
+                "breathing": {"breathing_rate": None, "breathing_score": 0.5, "detail": "Live mode - assessment unavailable"},
+                "motion": {"motion_score": 0.5, "detail": "Live mode - assessment unavailable"},
+                "details": ["Visual assessment not available in live mode"],
             }
 
         return {
@@ -233,7 +244,7 @@ def run_pipeline(video_path: str) -> dict:
             error_detail=str(e),
         )
 
-    return _run_analysis_on_roi(roi_result)
+    return _run_analysis_on_roi(roi_result, video_path)
 
 
 def _error_response(warnings: list, error_detail: str = None) -> dict:
@@ -655,7 +666,7 @@ async def live_video_endpoint(websocket: WebSocket):
                     roi_res = _build_live_roi(
                         green_buffers, rgb_buffers, fps_estimate, frame_count
                     )
-                    intermediate = _run_analysis_on_roi(roi_res)
+                    intermediate = _run_analysis_on_roi(roi_res, None)
                     intermediate["is_final"] = False
                     await websocket.send_json(intermediate)
                     last_intermediate_at = frame_count
@@ -674,7 +685,7 @@ async def live_video_endpoint(websocket: WebSocket):
             roi_res = _build_live_roi(
                 green_buffers, rgb_buffers, fps_estimate, frame_count
             )
-            final = _run_analysis_on_roi(roi_res)
+            final = _run_analysis_on_roi(roi_res, None)
             final["is_final"] = True
             await websocket.send_json(final)
             logger.info(
