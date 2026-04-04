@@ -128,7 +128,7 @@ def classify_stress(hrv: HRVResult) -> Tuple[str, float, List[str]]:
     # ── Edge case: limited data reduces confidence ──
     if len(hrv.ibi_ms) < 10:
         confidence *= 0.85  # reduce by 15%
-        warnings.append("Limited data - stress estimate may be unreliable.")
+        # warnings.append("Limited data - stress estimate may be unreliable.")
         logger.info("Short IBI array (%d values), reducing confidence", len(hrv.ibi_ms))
 
     confidence = round(float(confidence), 3)
@@ -191,7 +191,7 @@ def classify_stress_ml(
         warnings: List[str] = []
         if len(hrv.ibi_ms) < 10:
             confidence *= 0.85
-            warnings.append("Limited data - stress estimate may be unreliable.")
+            # warnings.append("Limited data - stress estimate may be unreliable.")
 
         logger.info("ML classifier: %s (confidence=%.3f)", level, confidence)
         return level, round(confidence, 3), warnings

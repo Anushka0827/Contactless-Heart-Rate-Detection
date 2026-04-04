@@ -22,7 +22,7 @@ from pathlib import Path
 
 import cv2
 import numpy as np
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -168,7 +168,7 @@ def _run_analysis_on_roi(roi_result) -> dict:
     }
 
 
-def run_pipeline(video_path: str) -> dict:
+def run_pipeline(video_path: str, duration_sec: float = None) -> dict:
     """Execute the full analysis pipeline on a video file.
 
     Each pipeline stage is imported lazily so that the server can start
@@ -181,7 +181,7 @@ def run_pipeline(video_path: str) -> dict:
     # --- Stage 1: ROI extraction ---
     try:
         from src.roi_extractor import extract_rois
-        roi_result = extract_rois(video_path)
+        roi_result = extract_rois(video_path, duration_sec=duration_sec)
     except Exception as e:
         logger.error("ROI extraction failed: %s", e)
         return _error_response(
@@ -261,7 +261,7 @@ def _placeholder_signal_result(roi_result):
 # ---------------------------------------------------------------------------
 
 @app.post("/api/analyze")
-async def analyze_video(video: UploadFile = File(...)):
+async def analyze_video(video: UploadFile = File(...), duration_sec: float = Form(None)):
     """Accept a video file upload and run the full analysis pipeline.
 
     Args:
@@ -298,7 +298,7 @@ async def analyze_video(video: UploadFile = File(...)):
 
     try:
         start_time = time.time()
-        result = run_pipeline(tmp_path)
+        result = run_pipeline(tmp_path, duration_sec)
         elapsed_ms = (time.time() - start_time) * 1000
         result["processing_time_ms"] = round(elapsed_ms, 1)
 
@@ -343,9 +343,11 @@ async def live_video_endpoint(websocket: WebSocket):
         await websocket.close(code=1011)
         return
 
-    fps_estimate = 10.0  # frontend sends at ~10 FPS
+    fps_estimate = 10.0  # fallback baseline
+    duration_sec = None
     frame_count = 0
-
+    start_time = time.time()
+    
     green_buffers = [[] for _ in ROI_DEFINITIONS]
     rgb_buffers = [[] for _ in ROI_DEFINITIONS]
     landmarks_list = []
@@ -354,6 +356,7 @@ async def live_video_endpoint(websocket: WebSocket):
         while True:
             data = await websocket.receive_json()
             if data.get("action") == "stop":
+                duration_sec = data.get("duration_sec", None)
                 break
 
             frame_b64 = data.get("frame")
@@ -402,7 +405,13 @@ async def live_video_endpoint(websocket: WebSocket):
 
         # --- Stop received: run final analysis ---
         if frame_count > 10:
-            roi_res = _build_live_roi(green_buffers, rgb_buffers, fps_estimate, frame_count)
+            if duration_sec is not None and float(duration_sec) > 0:
+                true_fps = frame_count / float(duration_sec)
+            else:
+                elapsed = time.time() - start_time
+                true_fps = frame_count / elapsed if elapsed > 0 else 10.0
+                
+            roi_res = _build_live_roi(green_buffers, rgb_buffers, true_fps, frame_count)
             final = _run_analysis_on_roi(roi_res)
             final["is_final"] = True
             await websocket.send_json(final)
