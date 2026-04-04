@@ -217,6 +217,20 @@ def chrom_algorithm(rgb_signal: np.ndarray, fps: float,
 
 def extract_bpm(bvp_signal: np.ndarray, fps: float,
                 low_bpm: float = 42, high_bpm: float = 200) -> Optional[float]:
+    """Extract BPM from BVP signal using FFT with harmonic rejection.
+
+    The key insight: rPPG signals often have a stronger 2nd harmonic
+    than the fundamental frequency. A heart rate of 70 BPM produces
+    a peak at 70 BPM AND a stronger peak at 140 BPM. Without harmonic
+    rejection, the algorithm would report 140 BPM — which is wrong.
+
+    Strategy:
+        1. Find top 5 FFT peaks
+        2. For any peak > 100 BPM, check if a sub-harmonic exists at half
+        3. If sub-harmonic has >20% of peak's power → it's the true HR
+        4. Cross-validate with peak detection
+        5. Prefer resting range (50-100 BPM) when ambiguous
+    """
     N = len(bvp_signal)
     if N < 2:
         return None
@@ -234,23 +248,56 @@ def extract_bpm(bvp_signal: np.ndarray, fps: float,
     valid_freqs = freqs[mask]
     valid_spectrum = spectrum[mask]
 
-    # Get top 3 candidate peaks
-    top_indices = np.argsort(valid_spectrum)[-3:][::-1]
+    # Get top 5 candidate peaks
+    n_top = min(5, len(valid_spectrum))
+    top_indices = np.argsort(valid_spectrum)[-n_top:][::-1]
     candidates = [(valid_freqs[i] * 60.0, valid_spectrum[i]) for i in top_indices]
 
-    # Cross-validate with peak detection
+    # --- Harmonic rejection ---
+    # If the top candidate is > 100 BPM, check for a sub-harmonic at half
+    corrected_candidates = []
+    for bpm_val, power in candidates:
+        if bpm_val > 100:
+            sub_hz = (bpm_val / 2.0) / 60.0
+            # Find the closest frequency bin to the sub-harmonic
+            sub_idx = np.argmin(np.abs(valid_freqs - sub_hz))
+            sub_power = valid_spectrum[sub_idx]
+            sub_bpm = valid_freqs[sub_idx] * 60.0
+
+            # If sub-harmonic has significant power (>20%), prefer it
+            if sub_power > power * 0.20 and 42 <= sub_bpm <= 120:
+                logger.debug(
+                    "Harmonic rejection: %.1f BPM (power=%.0f) → sub-harmonic %.1f BPM (power=%.0f)",
+                    bpm_val, power, sub_bpm, sub_power
+                )
+                corrected_candidates.append((sub_bpm, sub_power * 2))  # boost sub-harmonic
+            else:
+                corrected_candidates.append((bpm_val, power))
+        else:
+            corrected_candidates.append((bpm_val, power))
+
+    # Sort by power after correction
+    corrected_candidates.sort(key=lambda c: c[1], reverse=True)
+
+    # --- Cross-validate with peak detection ---
     peaks = detect_peaks(bvp_signal, fps)
-    if len(peaks) >= 2:
+    if len(peaks) >= 3:
         ibis = np.diff(peaks) / fps
-        peak_bpm = 60.0 / np.mean(ibis)
-        # Pick the FFT candidate closest to peak-derived BPM
-        best = min(candidates, key=lambda c: abs(c[0] - peak_bpm))
+        # Use median IBI (more robust to outliers than mean)
+        peak_bpm = 60.0 / np.median(ibis)
+
+        # Pick the candidate closest to peak-derived BPM
+        best = min(corrected_candidates, key=lambda c: abs(c[0] - peak_bpm))
         bpm = best[0]
     else:
-        # Fall back to strongest FFT peak
-        bpm = candidates[0][0]
+        # Prefer resting range (50-100) if available
+        resting = [c for c in corrected_candidates if 50 <= c[0] <= 100]
+        if resting:
+            bpm = resting[0][0]
+        else:
+            bpm = corrected_candidates[0][0]
 
-    logger.debug("FFT candidates: %s → selected %.1f BPM", candidates, bpm)
+    logger.debug("FFT candidates: %s → selected %.1f BPM", corrected_candidates[:3], bpm)
     return round(float(bpm), 1)
 
 
