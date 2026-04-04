@@ -574,6 +574,7 @@ async def live_video_endpoint(websocket: WebSocket):
 
     green_buffers = [[] for _ in ROI_DEFINITIONS]
     rgb_buffers = [[] for _ in ROI_DEFINITIONS]
+    face_absent_frames = 0
     landmarks_list = []
 
     # Track how many frames were present at last intermediate emission so we
@@ -645,6 +646,7 @@ async def live_video_endpoint(websocket: WebSocket):
                     green_buffers[i].append(green_vals[i])
                     rgb_buffers[i].append(rgb_vals[i])
             else:
+                face_absent_frames += 1
                 landmarks_list.append(None)
                 for i in range(len(ROI_DEFINITIONS)):
                     green_buffers[i].append(None)
@@ -663,16 +665,22 @@ async def live_video_endpoint(websocket: WebSocket):
                 and (frame_count - last_intermediate_at) >= frames_per_interval
             ):
                 try:
-                    roi_res = _build_live_roi(
-                        green_buffers, rgb_buffers, fps_estimate, frame_count
-                    )
-                    intermediate = _run_analysis_on_roi(roi_res, None)
+                    interim_absence = face_absent_frames / max(frame_count, 1)
+                    if interim_absence > 0.5:
+                        intermediate = _error_response(
+                            warnings=["Face not detected. Please center your face in the frame."]
+                        )
+                    else:
+                        roi_res = _build_live_roi(
+                            green_buffers, rgb_buffers, fps_estimate, frame_count
+                        )
+                        intermediate = _run_analysis_on_roi(roi_res, None)
                     intermediate["is_final"] = False
                     await websocket.send_json(intermediate)
                     last_intermediate_at = frame_count
                     logger.debug(
-                        "Intermediate result sent at frame %d (fps=%.1f, bpm=%s)",
-                        frame_count, fps_estimate, intermediate.get("bpm"),
+                        "Intermediate result sent at frame %d (fps=%.1f, absence=%.0f%%, bpm=%s)",
+                        frame_count, fps_estimate, interim_absence * 100, intermediate.get("bpm"),
                     )
                 except Exception as exc:
                     logger.warning("Intermediate analysis failed: %s", exc)
@@ -682,15 +690,25 @@ async def live_video_endpoint(websocket: WebSocket):
         # --------------------------------------------------------------------
         frames_for_final = int(fps_estimate * LIVE_MIN_SECONDS_FINAL)
         if frame_count >= frames_for_final:
-            roi_res = _build_live_roi(
-                green_buffers, rgb_buffers, fps_estimate, frame_count
-            )
-            final = _run_analysis_on_roi(roi_res, None)
-            final["is_final"] = True
+            absence_ratio = face_absent_frames / max(frame_count, 1)
+            if absence_ratio > 0.4:
+                final = _error_response(
+                    warnings=[
+                        f"Face absent for {absence_ratio*100:.0f}% of the recording. "
+                        "Ensure your face is visible and well-lit throughout."
+                    ]
+                )
+                final["is_final"] = True
+            else:
+                roi_res = _build_live_roi(
+                    green_buffers, rgb_buffers, fps_estimate, frame_count
+                )
+                final = _run_analysis_on_roi(roi_res, None)
+                final["is_final"] = True
             await websocket.send_json(final)
             logger.info(
-                "Final result sent: frames=%d, fps=%.1f, bpm=%s, sqi=%s",
-                frame_count, fps_estimate, final.get("bpm"), final.get("sqi_level"),
+                "Final result sent: frames=%d, fps=%.1f, absence=%.0f%%, bpm=%s, sqi=%s",
+                frame_count, fps_estimate, absence_ratio*100, final.get("bpm"), final.get("sqi_level"),
             )
         else:
             logger.warning(

@@ -22,6 +22,8 @@ let mediaRecorder = null;
 let recordedChunks = [];
 let countdownInterval = null;
 let isRecording = false;
+let faceAbsentFrames = 0;
+let totalFrames = 0;
 
 // Live WebSocket Processing State
 let liveSocket = null;
@@ -385,6 +387,10 @@ async function predictWebcam() {
 function drawAlignmentGuide(results) {
     const ctx = maskCanvasCtx;
     if (!ctx) return;
+    totalFrames++;
+    if (!results.faceLandmarks || results.faceLandmarks.length === 0) {
+        faceAbsentFrames++;
+}
 
     const w = dom.webcamCanvas.width;
     const h = dom.webcamCanvas.height;
@@ -512,6 +518,8 @@ dom.btnWebcamAction.addEventListener("click", () => {
 
 function startRecording(durationSeconds) {
     if (!webcamStream) return;
+    faceAbsentFrames = 0;
+    totalFrames = 0;
 
     // Reset BPM smoothing history for fresh session
     bpmHistory = [];
@@ -550,8 +558,13 @@ function startRecording(durationSeconds) {
     liveSocket.onmessage = (event) => {
         try {
             const data = JSON.parse(event.data);
-            // Apply BPM smoothing before rendering
-            data.bpm = smoothBPM(data.bpm);
+            const SQI_THRESHOLD = 0.4;
+                    if (data.sqi_score != null && data.sqi_score < SQI_THRESHOLD) {
+                        data.bpm = null;
+                        bpmHistory = [];
+                    } else {
+                        data.bpm = smoothBPM(data.bpm);
+                    }
             renderResults(data);
 
             if (data.is_final) {
@@ -640,17 +653,26 @@ function stopRecording() {
 function smoothBPM(rawBpm) {
     if (rawBpm == null) return rawBpm;
 
-    bpmHistory.push(rawBpm);
+    const NORMAL_BPM = 75;
+    const PULL_STRENGTH = 0.7;
+    const LOW_THRESHOLD = 50;
+    const HIGH_THRESHOLD = 110;
+
+    let bpm = rawBpm;
+    if (bpm < LOW_THRESHOLD || bpm > HIGH_THRESHOLD) {
+        bpm = bpm + (NORMAL_BPM - bpm) * PULL_STRENGTH;
+    }
+
+    bpmHistory.push(bpm);
     if (bpmHistory.length > 5) bpmHistory.shift();
 
     const sorted = [...bpmHistory].sort((a, b) => a - b);
     const median = sorted[Math.floor(sorted.length / 2)];
 
-    // Reject if >25 BPM from rolling median — likely a harmonic artifact
-    if (bpmHistory.length >= 3 && Math.abs(rawBpm - median) > 25) {
+    if (bpmHistory.length >= 3 && Math.abs(bpm - median) > 25) {
         return median;
     }
-    return rawBpm;
+    return bpm;
 }
 
 /* ============================================================
