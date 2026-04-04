@@ -302,9 +302,164 @@ async def analyze_video(video: UploadFile = File(...)):
 
 
 # ---------------------------------------------------------------------------
+# POST /api/analyze/finger -- finger PPG endpoint
+# ---------------------------------------------------------------------------
+
+def run_finger_pipeline(video_path: str) -> dict:
+    """Process a finger-on-flashlight video for PPG analysis.
+
+    Instead of face ROI extraction, this reads the mean red channel
+    intensity per frame. The flashlight illuminates the finger, and
+    blood flow modulates the red light — giving a strong PPG signal.
+    """
+    import cv2
+    import numpy as np
+
+    warnings = []
+
+    # --- Stage 1: Extract red channel from video ---
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        return _error_response(warnings=["Could not open video file."])
+
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    red_signal = []
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        # Mean of red channel (BGR format, index 2 = Red)
+        red_signal.append(float(np.mean(frame[:, :, 2])))
+
+    cap.release()
+
+    if len(red_signal) < int(fps * 3):
+        return _error_response(
+            warnings=["Video too short for finger PPG analysis. Need at least 3 seconds."]
+        )
+
+    red = np.array(red_signal, dtype=np.float64)
+    logger.info("Finger PPG: %d frames at %.1f fps", len(red), fps)
+
+    # --- Stage 2: Signal processing ---
+    try:
+        from scipy.signal import detrend
+        from src.signal_processor import bandpass_filter, extract_bpm, detect_peaks
+
+        # Detrend and bandpass filter
+        red_detrended = detrend(red, type='linear')
+        red_filtered = bandpass_filter(red_detrended, fps, low=0.7, high=3.5)
+
+        # BPM via FFT
+        bpm = extract_bpm(red_filtered, fps)
+
+        # Peak detection
+        peaks = detect_peaks(red_filtered, fps)
+
+        # SQI estimate: finger PPG is typically high quality
+        from src.sqi_engine import compute_sqi
+        sqi_score, sqi_level, _ = compute_sqi(red_filtered, fps)
+
+    except Exception as e:
+        logger.error("Finger signal processing failed: %s", e)
+        return _error_response(warnings=[f"Signal processing failed: {e}"])
+
+    # --- Stage 3: HRV analysis ---
+    hrv_result = None
+    try:
+        from src.hrv_analyzer import compute_hrv
+        hrv_result = compute_hrv(peaks, fps)
+    except Exception as e:
+        logger.error("Finger HRV analysis failed: %s", e)
+        warnings.append(f"HRV analysis failed: {e}")
+
+    if hrv_result is None and not any("HRV" in w for w in warnings):
+        warnings.append("Insufficient peaks detected for HRV analysis.")
+
+    # --- Stage 4: Stress classification ---
+    stress_level = "UNKNOWN"
+    stress_confidence = 0.0
+    if hrv_result is not None:
+        try:
+            from src.stress_classifier import classify_stress
+            stress_level, stress_confidence, stress_warnings = classify_stress(hrv_result)
+            warnings.extend(stress_warnings)
+        except Exception as e:
+            logger.error("Stress classification failed: %s", e)
+            warnings.append(f"Stress classification failed: {e}")
+
+    # --- Build response ---
+    hrv_dict = None
+    if hrv_result is not None:
+        hrv_dict = {
+            "rmssd": hrv_result.rmssd,
+            "sdnn": hrv_result.sdnn,
+            "pnn50": hrv_result.pnn50,
+            "lf_hf_ratio": hrv_result.lf_hf_ratio,
+            "mean_hr": hrv_result.mean_hr,
+            "ibi_ms": hrv_result.ibi_ms,
+        }
+
+    return {
+        "bpm": round(hrv_result.mean_hr, 1) if hrv_result else bpm,
+        "sqi_score": sqi_score,
+        "sqi_level": sqi_level,
+        "per_roi_sqi": [sqi_score],
+        "bvp_waveform": red_filtered[:500].tolist(),
+        "hrv": hrv_dict,
+        "stress_level": stress_level,
+        "stress_confidence": stress_confidence,
+        "warnings": warnings,
+    }
+
+
+@app.post("/api/analyze/finger")
+async def analyze_finger(video: UploadFile = File(...)):
+    """Analyze pulse from finger-on-flashlight video.
+
+    The user places their finger on the camera+flashlight. The red channel
+    intensity oscillates with each heartbeat, giving a strong PPG signal.
+    """
+    if video.filename is None:
+        raise HTTPException(status_code=422, detail="No filename provided.")
+
+    ext = Path(video.filename).suffix.lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(status_code=422,
+            detail=f"Unsupported: '{ext}'. Accepted: {', '.join(sorted(ALLOWED_EXTENSIONS))}")
+
+    content = await video.read()
+    if len(content) == 0:
+        raise HTTPException(status_code=422, detail="Uploaded file is empty.")
+    if len(content) > MAX_FILE_SIZE_BYTES:
+        raise HTTPException(status_code=422,
+            detail=f"File too large ({len(content)/1024/1024:.1f}MB). Max: {MAX_FILE_SIZE_BYTES/1024/1024:.0f}MB.")
+
+    with tempfile.NamedTemporaryFile(suffix=ext, delete=False) as tmp:
+        tmp.write(content)
+        tmp_path = tmp.name
+
+    try:
+        start_time = time.time()
+        result = run_finger_pipeline(tmp_path)
+        elapsed_ms = (time.time() - start_time) * 1000
+        result["processing_time_ms"] = round(elapsed_ms, 1)
+        logger.info("Finger analysis: bpm=%s, time=%.0fms",
+                     result.get("bpm"), elapsed_ms)
+        return JSONResponse(content=result)
+    except Exception as e:
+        logger.exception("Finger analysis failed")
+        raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
+    finally:
+        Path(tmp_path).unlink(missing_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Serve frontend static files (must be the LAST mount)
 # ---------------------------------------------------------------------------
 
 _frontend_dir = Path(__file__).resolve().parent.parent.parent / "frontend"
 if _frontend_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(_frontend_dir), html=True), name="frontend")
+
