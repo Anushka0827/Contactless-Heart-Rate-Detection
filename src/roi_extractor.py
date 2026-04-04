@@ -297,6 +297,20 @@ def extract_rois(video_path, model_path=None):
 
     frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+
+    # --- Optimization: skip frames if FPS > 30 (mobile cameras often 60fps) ---
+    target_fps = min(fps, 30.0)
+    frame_skip = max(1, int(round(fps / target_fps)))
+    effective_fps = fps / frame_skip
+
+    # --- Optimization: downscale if resolution > 720p ---
+    scale = 1.0
+    max_dim = 720
+    if max(frame_w, frame_h) > max_dim:
+        scale = max_dim / max(frame_w, frame_h)
+        frame_w = int(frame_w * scale)
+        frame_h = int(frame_h * scale)
+
     cx, cy = frame_w // 2, frame_h // 2
     radius = int(min(frame_w, frame_h) * 0.35)
 
@@ -313,6 +327,15 @@ def extract_rois(video_path, model_path=None):
         ret, frame = cap.read()
         if not ret:
             break
+
+        # Skip frames for high-FPS optimization
+        if frame_count % frame_skip != 0:
+            frame_count += 1
+            continue
+
+        # Downscale if needed
+        if scale < 1.0:
+            frame = cv2.resize(frame, (frame_w, frame_h), interpolation=cv2.INTER_AREA)
 
         timestamp_ms = (frame_count / fps) * 1000.0
         frame_count += 1
@@ -347,7 +370,7 @@ def extract_rois(video_path, model_path=None):
         return ROIResult(
             green_signals=[[], [], []],
             face_detected=False,
-            fps=fps,
+            fps=effective_fps,
             frame_count=frame_count,
             rgb_signals=[[], [], []],
             landmarks_per_frame=[],
@@ -360,7 +383,7 @@ def extract_rois(video_path, model_path=None):
         return ROIResult(
             green_signals=[[], [], []],
             face_detected=False,
-            fps=fps,
+            fps=effective_fps,
             frame_count=frame_count,
             rgb_signals=[[], [], []],
             landmarks_per_frame=landmarks_list,
@@ -377,7 +400,7 @@ def extract_rois(video_path, model_path=None):
     return ROIResult(
         green_signals=green_signals,
         face_detected=True,
-        fps=fps,
+        fps=effective_fps,
         frame_count=frame_count,
         rgb_signals=rgb_signals,
         landmarks_per_frame=landmarks_list,
