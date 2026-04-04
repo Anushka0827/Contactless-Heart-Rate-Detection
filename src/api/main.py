@@ -381,7 +381,6 @@ async def live_video_endpoint(websocket: WebSocket):
     # frequency bin, causing the peak-finder to latch onto the wrong
     # harmonic and report BPM that is a multiple of the true rate.
     fps_estimate: float = LIVE_FPS_DEFAULT
-    fps_confirmed: bool = False
 
     frame_count = 0
 
@@ -407,7 +406,6 @@ async def live_video_endpoint(websocket: WebSocket):
                         client_fps = float(client_fps)
                         if LIVE_FPS_MIN <= client_fps <= LIVE_FPS_MAX:
                             fps_estimate = client_fps
-                            fps_confirmed = True
                             logger.info(
                                 "Live session FPS negotiated: %.1f", fps_estimate
                             )
