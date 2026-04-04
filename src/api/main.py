@@ -14,12 +14,15 @@ Pipeline orchestration:
 See docs/modules/06_api_server.md for implementation details.
 """
 
+import base64
 import logging
 import tempfile
 import time
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, UploadFile
+import cv2
+import numpy as np
+from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
@@ -45,6 +48,29 @@ ALLOWED_EXTENSIONS = {".mp4", ".webm", ".avi", ".mov", ".mkv"}
 # Upper limit for uploaded video files (50 MB)
 MAX_FILE_SIZE_BYTES = 50 * 1024 * 1024
 
+# ---------------------------------------------------------------------------
+# Live session constants
+# ---------------------------------------------------------------------------
+
+# Minimum seconds of buffered signal before we trust a POS/CHROM result.
+# Short windows produce noisy FFT peaks that can land on the 2nd harmonic.
+LIVE_MIN_SECONDS_FIRST_RESULT = 5.0
+
+# How often (in seconds of signal) to emit intermediate results after the
+# first one has been sent.
+LIVE_INTERMEDIATE_INTERVAL_SECONDS = 2.5
+
+# Minimum seconds needed to attempt a final analysis on WebSocket stop.
+LIVE_MIN_SECONDS_FINAL = 3.0
+
+# FPS bounds accepted from the client init message.
+LIVE_FPS_MIN = 5.0
+LIVE_FPS_MAX = 60.0
+
+# Default FPS assumption if client never sends an init message.
+# Matches the original frontend interval of 100 ms.
+LIVE_FPS_DEFAULT = 10.0
+
 
 # ---------------------------------------------------------------------------
 # Health check
@@ -60,28 +86,12 @@ def health_check():
 # Pipeline orchestration
 # ---------------------------------------------------------------------------
 
-def run_pipeline(video_path: str) -> dict:
-    """Execute the full analysis pipeline on a video file.
+def _run_analysis_on_roi(roi_result) -> dict:
+    """Run signal processing, HRV, and stress stages on an existing ROIResult.
 
-    Each pipeline stage is imported lazily so that the server can start
-    even when some modules are not yet implemented. Failures in any
-    stage are caught and reported in the warnings list rather than
-    crashing the entire request.
-
-    Returns a dictionary matching the API response schema.
+    Shared by both the batch /api/analyze and live /api/live endpoints.
     """
     warnings = []
-
-    # --- Stage 1: ROI extraction ---
-    try:
-        from src.roi_extractor import extract_rois
-        roi_result = extract_rois(video_path)
-    except Exception as e:
-        logger.error("ROI extraction failed: %s", e)
-        return _error_response(
-            warnings=["ROI extraction failed. Ensure the video contains a visible face."],
-            error_detail=str(e),
-        )
 
     if not roi_result.face_detected:
         return _error_response(
@@ -109,7 +119,7 @@ def run_pipeline(video_path: str) -> dict:
             "sqi_score": signal_result.sqi_score,
             "sqi_level": signal_result.sqi_level,
             "per_roi_sqi": signal_result.per_roi_sqi,
-            "bvp_waveform": signal_result.bvp_signal[:500],  # cap for payload size
+            "bvp_waveform": signal_result.bvp_signal[:500] if hasattr(signal_result, 'bvp_signal') else [],
             "hrv": None,
             "stress_level": "UNKNOWN",
             "stress_confidence": 0.0,
@@ -117,6 +127,7 @@ def run_pipeline(video_path: str) -> dict:
                 "Signal quality insufficient for reliable measurement.",
                 "Ensure adequate lighting and remain still during recording.",
             ],
+            "is_final": True,
         }
 
     # --- Stage 4: HRV analysis ---
@@ -167,16 +178,41 @@ def run_pipeline(video_path: str) -> dict:
         warnings.append("Signal quality is moderate. Results may have reduced accuracy.")
 
     return {
-        "bpm": round(hrv_result.mean_hr, 1) if hrv_result is not None else signal_result.bpm,
+        "bpm": round(hrv_result.mean_hr, 1) if hrv_result is not None and getattr(hrv_result, 'mean_hr', None) else getattr(signal_result, 'bpm', None),
         "sqi_score": signal_result.sqi_score,
         "sqi_level": signal_result.sqi_level,
         "per_roi_sqi": signal_result.per_roi_sqi,
-        "bvp_waveform": signal_result.bvp_signal[:500],
+        "bvp_waveform": signal_result.bvp_signal[:500] if hasattr(signal_result, 'bvp_signal') else [],
         "hrv": hrv_dict,
         "stress_level": stress_level,
         "stress_confidence": stress_confidence,
         "warnings": warnings,
+        "is_final": True,
     }
+
+
+def run_pipeline(video_path: str) -> dict:
+    """Execute the full analysis pipeline on a video file.
+
+    Each pipeline stage is imported lazily so that the server can start
+    even when some modules are not yet implemented. Failures in any
+    stage are caught and reported in the warnings list rather than
+    crashing the entire request.
+
+    Returns a dictionary matching the API response schema.
+    """
+    # --- Stage 1: ROI extraction ---
+    try:
+        from src.roi_extractor import extract_rois
+        roi_result = extract_rois(video_path)
+    except Exception as e:
+        logger.error("ROI extraction failed: %s", e)
+        return _error_response(
+            warnings=["ROI extraction failed. Ensure the video contains a visible face."],
+            error_detail=str(e),
+        )
+
+    return _run_analysis_on_roi(roi_result)
 
 
 def _error_response(warnings: list, error_detail: str = None) -> dict:
@@ -191,6 +227,7 @@ def _error_response(warnings: list, error_detail: str = None) -> dict:
         "stress_level": "UNKNOWN",
         "stress_confidence": 0.0,
         "warnings": warnings,
+        "is_final": True,
     }
 
 
@@ -221,7 +258,7 @@ def _placeholder_signal_result(roi_result):
     # Simple detrend
     arr = arr - np.mean(arr)
 
-    # Rough BPM from FFT
+    # Rough BPM from FFT — uses roi_result.fps so frequency bins are correct
     fps = roi_result.fps
     freqs = np.fft.rfftfreq(len(arr), d=1.0 / fps)
     spectrum = np.abs(np.fft.rfft(arr))
@@ -453,6 +490,220 @@ async def analyze_finger(video: UploadFile = File(...)):
         raise HTTPException(status_code=500, detail=f"Analysis failed: {e}")
     finally:
         Path(tmp_path).unlink(missing_ok=True)
+# WebSocket /api/live -- live webcam frame streaming
+# ---------------------------------------------------------------------------
+
+@app.websocket("/api/live")
+async def live_video_endpoint(websocket: WebSocket):
+    """Process webcam frames in real-time via WebSocket.
+
+    Protocol:
+        Client sends: {"action": "init", "fps": <number>} as the first message
+                      to negotiate the actual capture frame rate. The backend
+                      uses this value for all FFT frequency bin calculations,
+                      intermediate result thresholds, and ROIResult construction.
+                      Without the correct FPS the frequency axis is wrong and BPM
+                      reads high (typically landing on a harmonic of the true rate).
+
+        Client sends: {"frame": "<base64 jpeg>"} for each frame
+        Client sends: {"action": "stop"} to finalize
+
+        Server sends: intermediate JSON results once MIN_SECONDS_FIRST_RESULT of
+                      signal has been buffered, then every INTERMEDIATE_INTERVAL_SECONDS
+        Server sends: final JSON result with is_final=True after stop
+    """
+    await websocket.accept()
+    from src.roi_extractor import (
+        ROI_DEFINITIONS,
+        _create_landmarker,
+        _process_frame,
+    )
+
+    try:
+        landmarker = _create_landmarker(running_mode="IMAGE")
+    except Exception as e:
+        logger.error("Could not load landmarker for WS: %s", e)
+        await websocket.close(code=1011)
+        return
+
+    # fps_estimate is set by the client's init message.
+    # Keeping this accurate is critical: POS and CHROM both construct their
+    # FFT frequency axes using roi_result.fps. A wrong value shifts every
+    # frequency bin, causing the peak-finder to latch onto the wrong
+    # harmonic and report BPM that is a multiple of the true rate.
+    fps_estimate: float = LIVE_FPS_DEFAULT
+
+    frame_count = 0
+
+    green_buffers = [[] for _ in ROI_DEFINITIONS]
+    rgb_buffers = [[] for _ in ROI_DEFINITIONS]
+    landmarks_list = []
+
+    # Track how many frames were present at last intermediate emission so we
+    # can use a frame-delta trigger instead of modulo (avoids phase sensitivity).
+    last_intermediate_at = 0
+
+    try:
+        while True:
+            data = await websocket.receive_json()
+
+            # ----------------------------------------------------------------
+            # Init handshake — client declares actual capture FPS
+            # ----------------------------------------------------------------
+            if data.get("action") == "init":
+                client_fps = data.get("fps")
+                if client_fps is not None:
+                    try:
+                        client_fps = float(client_fps)
+                        if LIVE_FPS_MIN <= client_fps <= LIVE_FPS_MAX:
+                            fps_estimate = client_fps
+                            logger.info(
+                                "Live session FPS negotiated: %.1f", fps_estimate
+                            )
+                        else:
+                            logger.warning(
+                                "Client FPS %.1f out of accepted range [%.1f, %.1f]; "
+                                "using default %.1f",
+                                client_fps, LIVE_FPS_MIN, LIVE_FPS_MAX, fps_estimate,
+                            )
+                    except (TypeError, ValueError):
+                        logger.warning("Invalid FPS value from client: %r", client_fps)
+                continue
+
+            # ----------------------------------------------------------------
+            # Stop signal — run final analysis and close
+            # ----------------------------------------------------------------
+            if data.get("action") == "stop":
+                break
+
+            # ----------------------------------------------------------------
+            # Frame data
+            # ----------------------------------------------------------------
+            frame_b64 = data.get("frame")
+            if not frame_b64:
+                continue
+
+            # Strip data-URL prefix if present
+            if "," in frame_b64:
+                frame_b64 = frame_b64.split(",", 1)[1]
+
+            img_bytes = base64.b64decode(frame_b64)
+            img_arr = np.frombuffer(img_bytes, dtype=np.uint8)
+            frame = cv2.imdecode(img_arr, cv2.IMREAD_COLOR)
+
+            if frame is None:
+                continue
+
+            frame_h, frame_w = frame.shape[:2]
+
+            # IMAGE mode — no timestamp needed
+            green_vals, rgb_vals, lm_coords = _process_frame(
+                landmarker, frame, frame_w, frame_h, timestamp_ms=None
+            )
+
+            frame_count += 1
+            if green_vals is not None:
+                landmarks_list.append(lm_coords)
+                for i in range(len(ROI_DEFINITIONS)):
+                    green_buffers[i].append(green_vals[i])
+                    rgb_buffers[i].append(rgb_vals[i])
+            else:
+                landmarks_list.append(None)
+                for i in range(len(ROI_DEFINITIONS)):
+                    green_buffers[i].append(None)
+                    rgb_buffers[i].append(None)
+
+            # ----------------------------------------------------------------
+            # Intermediate result emission
+            # Thresholds are derived from fps_estimate so they scale correctly
+            # regardless of whether the client sends at 10 FPS or 25 FPS.
+            # ----------------------------------------------------------------
+            frames_for_first = int(fps_estimate * LIVE_MIN_SECONDS_FIRST_RESULT)
+            frames_per_interval = max(1, int(fps_estimate * LIVE_INTERMEDIATE_INTERVAL_SECONDS))
+
+            if (
+                frame_count >= frames_for_first
+                and (frame_count - last_intermediate_at) >= frames_per_interval
+            ):
+                try:
+                    roi_res = _build_live_roi(
+                        green_buffers, rgb_buffers, fps_estimate, frame_count
+                    )
+                    intermediate = _run_analysis_on_roi(roi_res)
+                    intermediate["is_final"] = False
+                    await websocket.send_json(intermediate)
+                    last_intermediate_at = frame_count
+                    logger.debug(
+                        "Intermediate result sent at frame %d (fps=%.1f, bpm=%s)",
+                        frame_count, fps_estimate, intermediate.get("bpm"),
+                    )
+                except Exception as exc:
+                    logger.warning("Intermediate analysis failed: %s", exc)
+
+        # --------------------------------------------------------------------
+        # Stop received: run final analysis over all buffered frames
+        # --------------------------------------------------------------------
+        frames_for_final = int(fps_estimate * LIVE_MIN_SECONDS_FINAL)
+        if frame_count >= frames_for_final:
+            roi_res = _build_live_roi(
+                green_buffers, rgb_buffers, fps_estimate, frame_count
+            )
+            final = _run_analysis_on_roi(roi_res)
+            final["is_final"] = True
+            await websocket.send_json(final)
+            logger.info(
+                "Final result sent: frames=%d, fps=%.1f, bpm=%s, sqi=%s",
+                frame_count, fps_estimate, final.get("bpm"), final.get("sqi_level"),
+            )
+        else:
+            logger.warning(
+                "Not enough frames for final analysis: got %d, need %d (fps=%.1f)",
+                frame_count, frames_for_final, fps_estimate,
+            )
+            await websocket.send_json(
+                _error_response(
+                    warnings=[
+                        f"Insufficient data: only {frame_count / fps_estimate:.1f}s of signal captured "
+                        f"(minimum {LIVE_MIN_SECONDS_FINAL:.0f}s required)."
+                    ]
+                )
+            )
+
+    except WebSocketDisconnect:
+        logger.info("Client disconnected from live session (frames=%d)", frame_count)
+    except Exception as e:
+        logger.error("Live processing error: %s", e, exc_info=True)
+    finally:
+        landmarker.close()
+
+
+def _build_live_roi(green_buffers, rgb_buffers, fps, frame_count):
+    """Build a clean ROIResult from live frame buffers.
+
+    The fps argument is passed through to ROIResult.fps so that downstream
+    signal processing modules (POS, CHROM) construct correct FFT frequency
+    axes. This is why accurate FPS negotiation matters end-to-end.
+    """
+    from src.models import ROIResult
+    from src.roi_extractor import _interpolate_gaps, _interpolate_rgb_gaps
+
+    temp_green = [_interpolate_gaps(buf, max_gap=5) for buf in green_buffers]
+    temp_rgb = [_interpolate_rgb_gaps(buf, max_gap=5) for buf in rgb_buffers]
+
+    # Scrub remaining Nones that would crash scipy.detrend
+    temp_green = [[x if x is not None else 0.0 for x in buf] for buf in temp_green]
+    temp_rgb = [
+        [[c if c is not None else 0.0 for c in p] if p is not None else [0.0, 0.0, 0.0] for p in buf]
+        for buf in temp_rgb
+    ]
+
+    return ROIResult(
+        green_signals=temp_green,
+        rgb_signals=temp_rgb,
+        face_detected=True,
+        fps=fps,
+        frame_count=frame_count,
+    )
 
 
 # ---------------------------------------------------------------------------
