@@ -486,31 +486,6 @@ function drawAlignmentGuide(results) {
     }
 }
 
-    ctx.fillStyle = "rgba(0, 0, 0, 0.7)";
-    ctx.fillRect(0, 0, w, h);
-
-    ctx.globalCompositeOperation = "destination-out";
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.fill();
-    ctx.globalCompositeOperation = "source-over";
-
-    const color = isAligned ? "#34d399" : "#f87171";
-    ctx.beginPath();
-    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 3;
-    ctx.stroke();
-
-    ctx.fillStyle = color;
-    ctx.font = "bold 16px Inter, sans-serif";
-    ctx.fillText(isRecording ? "RECORDING: Please do not move" : alignMsg, 20, 40);
-
-    if (!isRecording) {
-        dom.btnWebcamAction.disabled = !isAligned;
-    }
-
-
 function stopWebcam() {
     if (animationFrameId) {
         cancelAnimationFrame(animationFrameId);
