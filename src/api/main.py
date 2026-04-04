@@ -347,7 +347,7 @@ async def live_video_endpoint(websocket: WebSocket):
     duration_sec = None
     frame_count = 0
     start_time = time.time()
-    
+
     green_buffers = [[] for _ in ROI_DEFINITIONS]
     rgb_buffers = [[] for _ in ROI_DEFINITIONS]
     landmarks_list = []
@@ -410,7 +410,7 @@ async def live_video_endpoint(websocket: WebSocket):
             else:
                 elapsed = time.time() - start_time
                 true_fps = frame_count / elapsed if elapsed > 0 else 10.0
-                
+
             roi_res = _build_live_roi(green_buffers, rgb_buffers, true_fps, frame_count)
             final = _run_analysis_on_roi(roi_res)
             final["is_final"] = True
