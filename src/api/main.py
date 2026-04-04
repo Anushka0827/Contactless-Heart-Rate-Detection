@@ -112,22 +112,40 @@ def _run_analysis_on_roi(roi_result) -> dict:
             warnings=[f"Signal processing failed: {e}"],
         )
 
-    # --- Stage 3: SQI gate ---
+    # --- Stage 3: SQI gate + Triage Decision Agent ---
+    # TWIST 1: When SQI is LOW, switch to Visual Assessment Mode
     if signal_result.sqi_level == "LOW":
+        logger.info("SQI is LOW — Triage Decision Agent switching to Visual Assessment Mode")
+        try:
+            from src.visual_assessor import assess_visual_distress
+            visual = assess_visual_distress(video_path)
+        except Exception as e:
+            logger.error("Visual assessment failed: %s", e)
+            visual = {
+                "visual_stress_score": 0.5,
+                "visual_stress_level": "UNKNOWN",
+                "pallor": {"pallor_score": 0.5, "detail": "Assessment unavailable"},
+                "breathing": {"breathing_rate": None, "breathing_score": 0.5, "detail": "Assessment unavailable"},
+                "motion": {"motion_score": 0.5, "detail": "Assessment unavailable"},
+                "details": [f"Visual assessment error: {e}"],
+            }
+
         return {
             "bpm": None,
             "sqi_score": signal_result.sqi_score,
             "sqi_level": signal_result.sqi_level,
             "per_roi_sqi": signal_result.per_roi_sqi,
-            "bvp_waveform": signal_result.bvp_signal[:500] if hasattr(signal_result, 'bvp_signal') else [],
+            "bvp_waveform": signal_result.bvp_signal[:500],
             "hrv": None,
-            "stress_level": "UNKNOWN",
-            "stress_confidence": 0.0,
+            "stress_level": visual["visual_stress_level"],
+            "stress_confidence": visual["visual_stress_score"],
+            "active_mode": "visual_assessment",
+            "mode_reason": "rPPG signal quality below confidence threshold — switched to visual analysis",
+            "visual_assessment": visual,
             "warnings": [
-                "Signal quality insufficient for reliable measurement.",
-                "Ensure adequate lighting and remain still during recording.",
-            ],
-            "is_final": True,
+                "Biometric mode unavailable — signal quality too low.",
+                "Visual Assessment Mode activated: analyzing physical distress indicators.",
+            ] + visual.get("details", []),
         }
 
     # --- Stage 4: HRV analysis ---
@@ -186,6 +204,9 @@ def _run_analysis_on_roi(roi_result) -> dict:
         "hrv": hrv_dict,
         "stress_level": stress_level,
         "stress_confidence": stress_confidence,
+        "active_mode": "biometric",
+        "mode_reason": "rPPG signal quality sufficient for biometric analysis",
+        "visual_assessment": None,
         "warnings": warnings,
         "is_final": True,
     }
@@ -386,8 +407,9 @@ def run_finger_pipeline(video_path: str) -> dict:
         from src.signal_processor import bandpass_filter, detect_peaks, extract_bpm
 
         # Detrend and bandpass filter
+        # Finger PPG has much stronger signal → use tighter band (48-150 BPM)
         red_detrended = detrend(red, type='linear')
-        red_filtered = bandpass_filter(red_detrended, fps, low=0.7, high=3.5)
+        red_filtered = bandpass_filter(red_detrended, fps, low=0.8, high=2.5)
 
         # BPM via FFT
         bpm = extract_bpm(red_filtered, fps)
@@ -448,6 +470,9 @@ def run_finger_pipeline(video_path: str) -> dict:
         "hrv": hrv_dict,
         "stress_level": stress_level,
         "stress_confidence": stress_confidence,
+        "active_mode": "biometric",
+        "mode_reason": "Finger PPG — direct contact provides strong signal",
+        "visual_assessment": None,
         "warnings": warnings,
     }
 
